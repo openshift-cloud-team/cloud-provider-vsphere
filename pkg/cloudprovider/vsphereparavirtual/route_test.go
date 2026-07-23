@@ -82,6 +82,8 @@ func buildFakeNode(nodeName string) *v1.Node {
 func buildFakeRouteInfo(clusterName, nameHint, dstCIDR, nodeName, nodeIP string) *helper.RouteInfo {
 	labels := map[string]string{
 		helper.LabelKeyClusterName: clusterName,
+		helper.LabelKeyNodeName:    nodeName,
+		helper.LabelKeyIPFamily:    helper.IPFamilyLabel(dstCIDR),
 	}
 	nodeRef := metav1.OwnerReference{
 		APIVersion: "v1",
@@ -238,6 +240,7 @@ func TestDeleteRoute(t *testing.T) {
 		TargetNode:      types.NodeName(testNodeName),
 		DestinationCIDR: testCIDR,
 	}
+	// Create the CR with the name that crNameForRoute produces for IPv4 (bare node name).
 	fakeRouteInfo := buildFakeRouteInfo(testClustername, testNameHint, testCIDR, testNodeName, testNodeIP)
 	routeSetCR, err := r.routeManager.CreateRouteCR(context.TODO(), fakeRouteInfo)
 	assert.NoError(t, err)
@@ -256,6 +259,7 @@ func TestDeleteRouteFailed(t *testing.T) {
 		DestinationCIDR: testCIDR,
 	}
 
+	// Create the CR with the bare node name (IPv4 convention).
 	fakeRouteInfo := buildFakeRouteInfo(testClustername, testNameHint, testCIDR, testNodeName, testNodeIP)
 	routeSetCR, err := r.routeManager.CreateRouteCR(context.TODO(), fakeRouteInfo)
 	assert.NoError(t, err)
@@ -294,4 +298,24 @@ func TestCheckStaticRouteRealizedState(t *testing.T) {
 	assert.NoError(t, err)
 	err = r.routeManager.DeleteRouteCR(fakeNode2.Name)
 	assert.NoError(t, err)
+}
+
+func TestCrNameForRoute(t *testing.T) {
+	tests := []struct {
+		name     string
+		nodeName string
+		cidr     string
+		expected string
+	}{
+		{"IPv4 CIDR uses bare node name", "node-1", "10.244.0.0/24", "node-1"},
+		{"IPv6 CIDR gets -ipv6 suffix", "node-1", "fd00::/80", "node-1" + helper.SuffixIPv6},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := crNameForRoute(tt.nodeName, tt.cidr)
+			if got != tt.expected {
+				t.Errorf("crNameForRoute(%q, %q) = %q, want %q", tt.nodeName, tt.cidr, got, tt.expected)
+			}
+		})
+	}
 }

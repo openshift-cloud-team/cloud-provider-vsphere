@@ -23,20 +23,20 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-
 	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha2"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/api/node/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
-	rest "k8s.io/client-go/rest"
-	clientgotesting "k8s.io/client-go/testing"
-
 	"k8s.io/apimachinery/pkg/util/intstr"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clientgotesting "k8s.io/client-go/testing"
 
-	vmopclient "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator/client"
+	adapterv2 "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator/adapter/v1alpha2"
+	fakev2 "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator/adapter/v1alpha2/fake"
+	clientv2 "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator/provider/v1alpha2"
+	vmoptypes "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator/types"
 )
 
 var (
@@ -80,31 +80,53 @@ func initTest(serviceAnnotationPropagationEnabled bool) (*v1.Service, VMService,
 	scheme := runtime.NewScheme()
 	_ = vmopv1.AddToScheme(scheme)
 	fc := dynamicfake.NewSimpleDynamicClient(scheme)
-	vms = NewVMService(vmopclient.NewFakeClientSet(fc), testClusterNameSpace, &testOwnerReference, serviceAnnotationPropagationEnabled)
+	vmopAdapter := adapterv2.NewWithFakeClient(clientv2.NewWithDynamicClient(fc))
+	vms = NewVMService(vmopAdapter, testClusterNameSpace, &testOwnerReference, serviceAnnotationPropagationEnabled)
 	return testK8sService, vms, fc
 }
 
 func TestNewVMService(t *testing.T) {
 	testCases := []struct {
-		name   string
-		config *rest.Config
-		err    error
+		name                                string
+		serviceAnnotationPropagationEnabled bool
 	}{
 		{
-			name:   "NewVMService: when everything is ok",
-			config: &rest.Config{},
-			err:    nil,
+			name:                                "annotation propagation disabled",
+			serviceAnnotationPropagationEnabled: false,
+		},
+		{
+			name:                                "annotation propagation enabled",
+			serviceAnnotationPropagationEnabled: true,
 		},
 	}
 
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			client, err := GetVmopClient(testCase.config)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeAdapter, _ := fakev2.NewAdapter()
+			svc := NewVMService(fakeAdapter, testClusterNameSpace, &testOwnerReference, tc.serviceAnnotationPropagationEnabled)
+			assert.NotNil(t, svc)
+			// Verify the constructed service correctly propagates annotations
+			// by creating a service and checking annotation presence.
+			k8sSvc := &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-svc",
+					Namespace:   testK8sServiceNameSpace,
+					Annotations: map[string]string{"custom-key": "custom-val"},
+				},
+				Spec: v1.ServiceSpec{
+					Ports: []v1.ServicePort{
+						{Name: "http", Port: 80, NodePort: 30080, Protocol: v1.ProtocolTCP},
+					},
+				},
+			}
+			created, err := svc.Create(context.Background(), k8sSvc, testClustername)
 			assert.NoError(t, err)
-			assert.NotEqual(t, client, nil)
-
-			realVms := NewVMService(client, testClusterNameSpace, &testOwnerReference, false)
-			assert.NotEqual(t, realVms, nil)
+			assert.NotNil(t, created)
+			if tc.serviceAnnotationPropagationEnabled {
+				assert.Equal(t, "custom-val", created.Annotations["custom-key"])
+			} else {
+				assert.NotContains(t, created.Annotations, "custom-key")
+			}
 		})
 	}
 }
@@ -131,8 +153,8 @@ func TestGetVMService_ReturnNil(t *testing.T) {
 			Namespace: testK8sServiceNameSpace,
 		},
 	}
-	vmService, err := vms.Get(context.Background(), k8sService, testClustername)
-	assert.Equal(t, vmService, (*vmopv1.VirtualMachineService)(nil))
+	vmServiceObj, err := vms.Get(context.Background(), k8sService, testClustername)
+	assert.Equal(t, vmServiceObj, (*vmoptypes.VirtualMachineServiceInfo)(nil))
 	assert.NoError(t, err)
 }
 
@@ -146,19 +168,179 @@ func TestGetVMService(t *testing.T) {
 	}
 	// create a fake VMService
 	createdVMService, _ := vms.Create(context.Background(), k8sService, testClustername)
-	vmService, err := vms.Get(context.Background(), k8sService, testClustername)
+	vmServiceObj, err := vms.Get(context.Background(), k8sService, testClustername)
 	assert.NoError(t, err)
-	assert.Equal(t, (*vmService).Spec, (*createdVMService).Spec)
+	assert.Equal(t, vmServiceObj.Spec, createdVMService.Spec)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
 }
 
+func TestGetVMService_LegacyFallback(t *testing.T) {
+	testK8sService, vms, _ := initTest(testServiceAnnotationPropagationEnabled)
+	k8sService := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testK8sServiceName,
+			Namespace: testK8sServiceNameSpace,
+		},
+	}
+
+	// Simulate a VirtualMachineService created by an older release: it lives
+	// under a name that does NOT match the current (SHA-256-based) scheme, but it
+	// carries the identifying labels that the CPI has always stamped on every
+	// VirtualMachineService.
+	legacyName := "legacy-" + testClustername + "-deadbeef"
+	ports, _ := findPorts(testK8sService)
+	legacyInfo := &vmoptypes.VirtualMachineServiceInfo{
+		Name:      legacyName,
+		Namespace: testClusterNameSpace,
+		Labels: map[string]string{
+			LabelClusterNameKey:      testClustername,
+			LabelServiceNameKey:      testK8sServiceName,
+			LabelServiceNameSpaceKey: testK8sServiceNameSpace,
+		},
+		Spec: vmoptypes.VirtualMachineServiceSpec{
+			Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
+			Ports: ports,
+			Selector: map[string]string{
+				ClusterSelectorKey: testClustername,
+				NodeSelectorKey:    NodeRole,
+			},
+		},
+	}
+	_, err := vms.(*vmService).vmClient.VirtualMachineServices().Create(context.Background(), legacyInfo)
+	assert.NoError(t, err)
+
+	// Sanity check: the legacy resource is not reachable by the current name.
+	currentName := vms.GetVMServiceName(k8sService, testClustername)
+	assert.NotEqual(t, legacyName, currentName)
+
+	// Get must fall back to the label-based lookup and find the legacy resource.
+	vmServiceObj, err := vms.Get(context.Background(), k8sService, testClustername)
+	assert.NoError(t, err)
+	assert.NotNil(t, vmServiceObj)
+	assert.Equal(t, legacyName, vmServiceObj.Name)
+
+	// Delete must likewise fall back and remove the legacy resource.
+	err = vms.Delete(context.Background(), k8sService, testClustername)
+	assert.NoError(t, err)
+
+	// Verify it is indeed deleted.
+	deletedObj, err := vms.(*vmService).vmClient.VirtualMachineServices().Get(context.Background(), testClusterNameSpace, legacyName)
+	assert.Error(t, err)
+	assert.True(t, apierrors.IsNotFound(err))
+	assert.Nil(t, deletedObj)
+}
+
+func TestGetVMService_LegacyLookupError(t *testing.T) {
+	testK8sService, vms, fc := initTest(testServiceAnnotationPropagationEnabled)
+
+	// No VMService exists under the current name, so Get falls back to the
+	// label-based legacy lookup. Make that List fail (e.g. a missing "list" RBAC
+	// permission). The lookup must fail closed: Get returns the error rather than
+	// (nil, nil), which would otherwise cause the caller to create a duplicate
+	// VMService under the new name-hashing scheme.
+	listErr := apierrors.NewForbidden(v1alpha1.Resource("virtualmachineservices"), "", fmt.Errorf("no list permission"))
+	fc.PrependReactor("list", "virtualmachineservices", func(clientgotesting.Action) (bool, runtime.Object, error) {
+		return true, nil, listErr
+	})
+
+	vmServiceObj, err := vms.Get(context.Background(), testK8sService, testClustername)
+	assert.Error(t, err)
+	assert.Nil(t, vmServiceObj)
+	assert.True(t, apierrors.IsForbidden(err))
+}
+
+func TestDeleteVMService_LegacyLookupError(t *testing.T) {
+	testK8sService, vms, fc := initTest(testServiceAnnotationPropagationEnabled)
+
+	// No VMService exists under the current name, so Delete falls back to the
+	// label-based legacy lookup. Make that List fail. The lookup must fail closed:
+	// Delete returns the error rather than reporting a successful (no-op) delete,
+	// which would otherwise silently orphan a legacy VMService we merely failed to
+	// read.
+	listErr := apierrors.NewForbidden(v1alpha1.Resource("virtualmachineservices"), "", fmt.Errorf("no list permission"))
+	fc.PrependReactor("list", "virtualmachineservices", func(clientgotesting.Action) (bool, runtime.Object, error) {
+		return true, nil, listErr
+	})
+
+	err := vms.Delete(context.Background(), testK8sService, testClustername)
+	assert.Error(t, err)
+	assert.True(t, apierrors.IsForbidden(err))
+}
+
+func TestGetVMService_LegacyMultipleMatches(t *testing.T) {
+	testK8sService, vms, _ := initTest(testServiceAnnotationPropagationEnabled)
+
+	// Create two legacy VirtualMachineServices with the same identifying labels.
+	ports, _ := findPorts(testK8sService)
+	for i := 1; i <= 2; i++ {
+		legacyName := fmt.Sprintf("legacy-%s-%d", testClustername, i)
+		legacyInfo := &vmoptypes.VirtualMachineServiceInfo{
+			Name:      legacyName,
+			Namespace: testClusterNameSpace,
+			Labels: map[string]string{
+				LabelClusterNameKey:      testClustername,
+				LabelServiceNameKey:      testK8sServiceName,
+				LabelServiceNameSpaceKey: testK8sServiceNameSpace,
+			},
+			Spec: vmoptypes.VirtualMachineServiceSpec{
+				Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
+				Ports: ports,
+				Selector: map[string]string{
+					ClusterSelectorKey: testClustername,
+					NodeSelectorKey:    NodeRole,
+				},
+			},
+		}
+		_, err := vms.(*vmService).vmClient.VirtualMachineServices().Create(context.Background(), legacyInfo)
+		assert.NoError(t, err)
+	}
+
+	// Get must fail and return ErrMultipleLegacyVMServices.
+	vmServiceObj, err := vms.Get(context.Background(), testK8sService, testClustername)
+	assert.ErrorIs(t, err, ErrMultipleLegacyVMServices)
+	assert.Nil(t, vmServiceObj)
+}
+
+func TestDeleteVMService_LegacyMultipleMatches(t *testing.T) {
+	testK8sService, vms, _ := initTest(testServiceAnnotationPropagationEnabled)
+
+	// Create two legacy VirtualMachineServices with the same identifying labels.
+	ports, _ := findPorts(testK8sService)
+	for i := 1; i <= 2; i++ {
+		legacyName := fmt.Sprintf("legacy-%s-%d", testClustername, i)
+		legacyInfo := &vmoptypes.VirtualMachineServiceInfo{
+			Name:      legacyName,
+			Namespace: testClusterNameSpace,
+			Labels: map[string]string{
+				LabelClusterNameKey:      testClustername,
+				LabelServiceNameKey:      testK8sServiceName,
+				LabelServiceNameSpaceKey: testK8sServiceNameSpace,
+			},
+			Spec: vmoptypes.VirtualMachineServiceSpec{
+				Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
+				Ports: ports,
+				Selector: map[string]string{
+					ClusterSelectorKey: testClustername,
+					NodeSelectorKey:    NodeRole,
+				},
+			},
+		}
+		_, err := vms.(*vmService).vmClient.VirtualMachineServices().Create(context.Background(), legacyInfo)
+		assert.NoError(t, err)
+	}
+
+	// Delete must fail and return ErrMultipleLegacyVMServices.
+	err := vms.Delete(context.Background(), testK8sService, testClustername)
+	assert.ErrorIs(t, err, ErrMultipleLegacyVMServices)
+}
+
 func TestCreateVMService(t *testing.T) {
 	testK8sService, vms, _ := initTest(testServiceAnnotationPropagationEnabled)
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -168,7 +350,7 @@ func TestCreateVMService(t *testing.T) {
 
 	vmServiceObj, err := vms.Create(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
@@ -177,8 +359,8 @@ func TestCreateVMService(t *testing.T) {
 func TestCreateVMServiceWithLegacySelector(t *testing.T) {
 	testK8sService, vms, _ := initTest(testServiceAnnotationPropagationEnabled)
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			LegacyClusterSelectorKey: testClustername,
@@ -189,7 +371,7 @@ func TestCreateVMServiceWithLegacySelector(t *testing.T) {
 	IsLegacy = true
 	vmServiceObj, err := vms.Create(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
@@ -218,18 +400,18 @@ func TestCreateVMService_ZeroNodeport(t *testing.T) {
 		},
 	}
 	vmServiceObj, err := vms.Create(context.Background(), k8sService, testClustername)
-	assert.Equal(t, vmServiceObj, (*vmopv1.VirtualMachineService)(nil))
+	assert.Equal(t, vmServiceObj, (*vmoptypes.VirtualMachineServiceInfo)(nil))
 	assert.Error(t, err)
 }
 
 func TestCreateDuplicateVMService(t *testing.T) {
 	testK8sService, vms, _ := initTest(testServiceAnnotationPropagationEnabled)
 	vmServiceObj, err := vms.Create(context.Background(), testK8sService, testClustername)
-	assert.NotEqual(t, vmServiceObj, (*vmopv1.VirtualMachineService)(nil))
+	assert.NotEqual(t, vmServiceObj, (*vmoptypes.VirtualMachineServiceInfo)(nil))
 	assert.NoError(t, err)
 	// Try to create the same object twice
 	vmServiceObj, err = vms.Create(context.Background(), testK8sService, testClustername)
-	assert.Equal(t, vmServiceObj, (*vmopv1.VirtualMachineService)(nil))
+	assert.Equal(t, vmServiceObj, (*vmoptypes.VirtualMachineServiceInfo)(nil))
 	assert.Error(t, err)
 }
 
@@ -238,7 +420,7 @@ func TestCreateVMService_LBConfigs(t *testing.T) {
 	testCases := []struct {
 		name           string
 		testK8sService *v1.Service
-		expectedSpec   vmopv1.VirtualMachineServiceSpec
+		expectedSpec   vmoptypes.VirtualMachineServiceSpec
 	}{
 		{
 			name: "when Service has loadBalancerIP defined",
@@ -263,8 +445,8 @@ func TestCreateVMService_LBConfigs(t *testing.T) {
 					LoadBalancerIP: fakeLBIP,
 				},
 			},
-			expectedSpec: vmopv1.VirtualMachineServiceSpec{
-				Type: vmopv1.VirtualMachineServiceTypeLoadBalancer,
+			expectedSpec: vmoptypes.VirtualMachineServiceSpec{
+				Type: vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 				Selector: map[string]string{
 					ClusterSelectorKey: testClustername,
 					NodeSelectorKey:    NodeRole,
@@ -295,8 +477,8 @@ func TestCreateVMService_LBConfigs(t *testing.T) {
 					LoadBalancerSourceRanges: []string{"1.1.1.0/24", "10.0.0.0/19"},
 				},
 			},
-			expectedSpec: vmopv1.VirtualMachineServiceSpec{
-				Type: vmopv1.VirtualMachineServiceTypeLoadBalancer,
+			expectedSpec: vmoptypes.VirtualMachineServiceSpec{
+				Type: vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 				Selector: map[string]string{
 					ClusterSelectorKey: testClustername,
 					NodeSelectorKey:    NodeRole,
@@ -312,7 +494,7 @@ func TestCreateVMService_LBConfigs(t *testing.T) {
 			testCase.expectedSpec.Ports = ports
 			vmServiceObj, err := vms.Create(context.Background(), testCase.testK8sService, testClustername)
 			assert.NoError(t, err)
-			assert.Equal(t, (*vmServiceObj).Spec, testCase.expectedSpec)
+			assert.Equal(t, vmServiceObj.Spec, testCase.expectedSpec)
 
 			testCase.testK8sService.Spec.LoadBalancerIP = ""
 			testCase.testK8sService.Spec.LoadBalancerSourceRanges = []string{}
@@ -462,8 +644,8 @@ func TestVMService_AlreadyExists(t *testing.T) {
 	}
 
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -475,17 +657,33 @@ func TestVMService_AlreadyExists(t *testing.T) {
 
 	vmServiceObj, err := vms.CreateOrUpdate(context.Background(), testK8sService, testClustername)
 	assert.Equal(t, err, ErrVMServiceIPNotFound)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
 }
 
 func TestUpdateVMService_NoChange(t *testing.T) {
-	testK8sService, vms, _ := initTest(testServiceAnnotationPropagationEnabled)
+	testK8sService, vms, fc := initTest(testServiceAnnotationPropagationEnabled)
 	createdVMService, _ := vms.Create(context.Background(), testK8sService, testClustername)
-	_, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
+
+	// Inject a reactor that fails the test if any "update" call reaches the
+	// fake dynamic client. When needsUpdate == false the adapter's Update
+	// method must not be invoked at all.
+	updateCalled := false
+	fc.PrependReactor("update", "virtualmachineservices", func(clientgotesting.Action) (bool, runtime.Object, error) {
+		updateCalled = true
+		return false, nil, nil // pass through so the fake still handles it
+	})
+
+	// When nothing has changed, Update must return the existing object unchanged
+	// (the needsUpdate == false path) without issuing an API write.
+	result, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
 	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, createdVMService.Spec, result.Spec)
+	assert.Equal(t, createdVMService.Name, result.Name)
+	assert.False(t, updateCalled, "adapter Update must not be called when nothing has changed")
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
@@ -496,8 +694,8 @@ func TestUpdateVMService_NodePortChanges(t *testing.T) {
 	oldK8sService := testK8sService.DeepCopy()
 	oldK8sService.Spec.Ports[0].NodePort = 30500
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -508,7 +706,7 @@ func TestUpdateVMService_NodePortChanges(t *testing.T) {
 	createdVMService, _ := vms.Create(context.Background(), oldK8sService, testClustername)
 
 	vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 	assert.NoError(t, err)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
@@ -520,8 +718,8 @@ func TestUpdateVMService_LBIPAdded(t *testing.T) {
 	oldK8sService := testK8sService.DeepCopy()
 	testK8sService.Spec.LoadBalancerIP = fakeLBIP
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -533,7 +731,7 @@ func TestUpdateVMService_LBIPAdded(t *testing.T) {
 	createdVMService, _ := vms.Create(context.Background(), oldK8sService, testClustername)
 
 	vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 	assert.NoError(t, err)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
@@ -546,8 +744,8 @@ func TestUpdateVMService_LBIPChanges(t *testing.T) {
 	testK8sService.Spec.LoadBalancerIP = fakeLBIP
 	oldK8sService.Spec.LoadBalancerIP = "2.2.2.2"
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -559,7 +757,7 @@ func TestUpdateVMService_LBIPChanges(t *testing.T) {
 	createdVMService, _ := vms.Create(context.Background(), oldK8sService, testClustername)
 
 	vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 	assert.NoError(t, err)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
@@ -571,8 +769,8 @@ func TestUpdateVMService_LBSourceRangesAdded(t *testing.T) {
 	oldK8sService := testK8sService.DeepCopy()
 	testK8sService.Spec.LoadBalancerSourceRanges = []string{"1.1.1.0/24"}
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -584,7 +782,7 @@ func TestUpdateVMService_LBSourceRangesAdded(t *testing.T) {
 	createdVMService, _ := vms.Create(context.Background(), oldK8sService, testClustername)
 
 	vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 	assert.NoError(t, err)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
@@ -597,8 +795,8 @@ func TestUpdateVMService_LBSourceRangesChanges(t *testing.T) {
 	testK8sService.Spec.LoadBalancerSourceRanges = []string{"1.1.1.0/24"}
 	oldK8sService.Spec.LoadBalancerSourceRanges = []string{"2.2.2.0/24"}
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -610,7 +808,7 @@ func TestUpdateVMService_LBSourceRangesChanges(t *testing.T) {
 	createdVMService, _ := vms.Create(context.Background(), oldK8sService, testClustername)
 
 	vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
 	assert.NoError(t, err)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
@@ -623,8 +821,8 @@ func TestUpdateVMService_ExternalTrafficPolicyLocal(t *testing.T) {
 	testK8sService.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeLocal
 	testK8sService.Spec.HealthCheckNodePort = 31234
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -640,8 +838,8 @@ func TestUpdateVMService_ExternalTrafficPolicyLocal(t *testing.T) {
 
 	vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
 	assert.NoError(t, err)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
-	assert.Equal(t, (*vmServiceObj).Annotations, expectedAnnotations)
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Annotations, expectedAnnotations)
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
@@ -655,8 +853,8 @@ func TestUpdateVMService_ExternalTrafficPolicyCluster(t *testing.T) {
 	testK8sService.Spec.HealthCheckNodePort = 31234
 	oldK8sService.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeLocal
 	ports, _ := findPorts(testK8sService)
-	expectedSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
+	expectedSpec := vmoptypes.VirtualMachineServiceSpec{
+		Type:  vmoptypes.VirtualMachineServiceTypeLoadBalancer,
 		Ports: ports,
 		Selector: map[string]string{
 			ClusterSelectorKey: testClustername,
@@ -668,8 +866,8 @@ func TestUpdateVMService_ExternalTrafficPolicyCluster(t *testing.T) {
 
 	vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
 	assert.NoError(t, err)
-	assert.Equal(t, (*vmServiceObj).Spec, expectedSpec)
-	assert.Equal(t, (*vmServiceObj).Annotations, map[string]string(nil))
+	assert.Equal(t, vmServiceObj.Spec, expectedSpec)
+	assert.Equal(t, vmServiceObj.Annotations, map[string]string(nil))
 
 	err = vms.Delete(context.Background(), testK8sService, testClustername)
 	assert.NoError(t, err)
@@ -744,7 +942,7 @@ func TestCreateVMService_ServiceAnnotationPropagation(t *testing.T) {
 			testK8sService.Annotations = tc.serviceAnnotations
 			vmServiceObj, err := vms.Create(context.Background(), testK8sService, testClustername)
 			assert.NoError(t, err)
-			assert.Equal(t, (*vmServiceObj).Annotations, tc.expectedAnnotations)
+			assert.Equal(t, vmServiceObj.Annotations, tc.expectedAnnotations)
 			err = vms.Delete(context.Background(), testK8sService, testClustername)
 			assert.NoError(t, err)
 		})
@@ -829,10 +1027,105 @@ func TestUpdateVMService_ServiceAnnotationPropagation(t *testing.T) {
 
 			vmServiceObj, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
 			assert.NoError(t, err)
-			assert.Equal(t, (*vmServiceObj).Annotations, tc.expectedAnnotations)
+			assert.Equal(t, vmServiceObj.Annotations, tc.expectedAnnotations)
 
 			err = vms.Delete(context.Background(), testK8sService, testClustername)
 			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestUpdateVMService_IPFamilyChanges(t *testing.T) {
+	policyPtr := func(p v1.IPFamilyPolicyType) *v1.IPFamilyPolicyType { return &p }
+
+	testCases := []struct {
+		name               string
+		existingFamilies   []v1.IPFamily
+		existingPolicy     *v1.IPFamilyPolicyType
+		desiredFamilies    []v1.IPFamily
+		desiredPolicy      *v1.IPFamilyPolicyType
+		expectUpdateCalled bool
+	}{
+		{
+			name:               "both nil: no update triggered",
+			existingFamilies:   nil,
+			existingPolicy:     nil,
+			desiredFamilies:    nil,
+			desiredPolicy:      nil,
+			expectUpdateCalled: false,
+		},
+		{
+			name:               "IPFamily added from nil triggers update",
+			existingFamilies:   nil,
+			existingPolicy:     nil,
+			desiredFamilies:    []v1.IPFamily{v1.IPv4Protocol},
+			desiredPolicy:      nil,
+			expectUpdateCalled: true,
+		},
+		{
+			name:               "IPFamily list extended triggers update",
+			existingFamilies:   []v1.IPFamily{v1.IPv4Protocol},
+			existingPolicy:     nil,
+			desiredFamilies:    []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol},
+			desiredPolicy:      nil,
+			expectUpdateCalled: true,
+		},
+		{
+			name:               "IPFamilyPolicy nil to PreferDualStack triggers update",
+			existingFamilies:   nil,
+			existingPolicy:     nil,
+			desiredFamilies:    nil,
+			desiredPolicy:      policyPtr(v1.IPFamilyPolicyPreferDualStack),
+			expectUpdateCalled: true,
+		},
+		{
+			name:               "IPFamilyPolicy value change triggers update",
+			existingFamilies:   nil,
+			existingPolicy:     policyPtr(v1.IPFamilyPolicySingleStack),
+			desiredFamilies:    nil,
+			desiredPolicy:      policyPtr(v1.IPFamilyPolicyPreferDualStack),
+			expectUpdateCalled: true,
+		},
+		{
+			name:               "same dual-stack families and policy: no update triggered",
+			existingFamilies:   []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol},
+			existingPolicy:     policyPtr(v1.IPFamilyPolicyPreferDualStack),
+			desiredFamilies:    []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol},
+			desiredPolicy:      policyPtr(v1.IPFamilyPolicyPreferDualStack),
+			expectUpdateCalled: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testK8sService, vms, fc := initTest(testServiceAnnotationPropagationEnabled)
+
+			// Create the initial VMService; IPFamily fields are intentionally absent here
+			// to mirror what an adapter (e.g. v1alpha2) would return when the feature is
+			// not supported by the API version in use.
+			createdVMService, _ := vms.Create(context.Background(), testK8sService, testClustername)
+
+			// Inject the "existing" IPFamily state as if the adapter had read it from
+			// the server (v1alpha6 would populate these via readDualStackFromUnstructured).
+			createdVMService.Spec.IPFamilies = tc.existingFamilies
+			createdVMService.Spec.IPFamilyPolicy = tc.existingPolicy
+
+			// Set the desired IPFamily state on the k8s Service.
+			testK8sService.Spec.IPFamilies = tc.desiredFamilies
+			testK8sService.Spec.IPFamilyPolicy = tc.desiredPolicy
+
+			updateCalled := false
+			fc.PrependReactor("update", "virtualmachineservices", func(clientgotesting.Action) (bool, runtime.Object, error) {
+				updateCalled = true
+				return false, nil, nil // pass through so the fake still handles the write
+			})
+
+			_, err := vms.Update(context.Background(), testK8sService, testClustername, createdVMService)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectUpdateCalled, updateCalled,
+				"adapter Update called=%v, want=%v", updateCalled, tc.expectUpdateCalled)
+
+			_ = vms.Delete(context.Background(), testK8sService, testClustername)
 		})
 	}
 }

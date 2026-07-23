@@ -18,7 +18,7 @@ package vmservice
 
 import (
 	"context"
-	"crypto/md5" // #nosec
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"reflect"
@@ -29,11 +29,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	rest "k8s.io/client-go/rest"
+	"k8s.io/apimachinery/pkg/labels"
 
-	vmopv1 "github.com/vmware-tanzu/vm-operator/api/v1alpha2"
 	vmop "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator"
-	vmopclient "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator/client"
+	vmoptypes "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphereparavirtual/vmoperator/types"
 )
 
 const (
@@ -83,12 +82,13 @@ var excludedAnnotations = []string{
 
 // A list of possible error messages
 var (
-	ErrCreateVMService     = errors.New("failed to create VirtualMachineService")
-	ErrUpdateVMService     = errors.New("failed to update VirtualMachineService")
-	ErrGetVMService        = errors.New("failed to get VirtualMachineService")
-	ErrDeleteVMService     = errors.New("failed to delete VirtualMachineService")
-	ErrVMServiceIPNotFound = errors.New("VirtualMachineService IP not found")
-	ErrNodePortNotFound    = errors.New("NodePort not found")
+	ErrCreateVMService          = errors.New("failed to create VirtualMachineService")
+	ErrUpdateVMService          = errors.New("failed to update VirtualMachineService")
+	ErrGetVMService             = errors.New("failed to get VirtualMachineService")
+	ErrDeleteVMService          = errors.New("failed to delete VirtualMachineService")
+	ErrVMServiceIPNotFound      = errors.New("VirtualMachineService IP not found")
+	ErrNodePortNotFound         = errors.New("NodePort not found")
+	ErrMultipleLegacyVMServices = errors.New("multiple VirtualMachineServices matched the legacy label lookup")
 )
 
 var (
@@ -96,12 +96,6 @@ var (
 	// Default to false
 	IsLegacy bool
 )
-
-// GetVmopClient gets a vm-operator-api client
-// This is separate from NewVMService so that a fake client can be injected for testing
-func GetVmopClient(config *rest.Config) (vmop.Interface, error) {
-	return vmopclient.NewForConfig(config)
-}
 
 // NewVMService creates a vmService object
 func NewVMService(vmClient vmop.Interface, ns string, ownerRef *metav1.OwnerReference, serviceAnnotationPropagationEnabled bool) VMService {
@@ -114,13 +108,52 @@ func NewVMService(vmClient vmop.Interface, ns string, ownerRef *metav1.OwnerRefe
 }
 
 func (s *vmService) hashString(str string) string {
-	// #nosec
-	hash := md5.New()
+	// SHA-256 is used as a FIPS-compliant, well-distributed hash to derive a
+	// deterministic name suffix. The output is later truncated to
+	// MaxCheckSumLen; this is not a security-sensitive use.
+	hash := sha256.New()
 	if _, err := hash.Write([]byte(str)); err != nil {
 		log.Error(err, "create hash string failed")
 	}
 
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// findLegacyVMService locates a VirtualMachineService that was created by an
+// older release using a different name-hashing scheme. It matches on the
+// identifying labels that the CPI has always stamped on every
+// VirtualMachineService, so the lookup is independent of how the name was
+// generated. Returns (nil, nil) when no matching resource exists.
+//
+// The lookup fails closed: any List error (including a missing "list" RBAC
+// permission) is returned to the caller rather than being swallowed. Swallowing
+// the error would make an unreadable legacy resource look like "not found",
+// causing the caller to create a duplicate VirtualMachineService under the new
+// name-hashing scheme. A genuine empty result is not an error, so a freshly
+// created Service (which has no VirtualMachineService yet) still returns
+// (nil, nil) and can proceed to Create.
+func (s *vmService) findLegacyVMService(ctx context.Context, service *v1.Service, clusterName string) (*vmoptypes.VirtualMachineServiceInfo, error) {
+	logger := log.WithValues("name", service.Name, "namespace", service.Namespace)
+
+	selector := labels.SelectorFromSet(labels.Set{
+		LabelClusterNameKey:      clusterName,
+		LabelServiceNameKey:      service.Name,
+		LabelServiceNameSpaceKey: service.Namespace,
+	}).String()
+
+	list, err := s.vmClient.VirtualMachineServices().List(ctx, s.namespace, vmoptypes.ListOptions{LabelSelector: selector})
+	if err != nil {
+		logger.Error(err, "failed to list VirtualMachineServices for legacy lookup")
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, nil
+	}
+	if len(list) > 1 {
+		logger.Error(ErrMultipleLegacyVMServices, "multiple VirtualMachineServices matched the legacy label lookup", "count", len(list))
+		return nil, ErrMultipleLegacyVMServices
+	}
+	return list[0], nil
 }
 
 // GetVMServiceName returns VirtualMachineService name for a lb type of service
@@ -137,13 +170,30 @@ func (s *vmService) GetVMServiceName(service *v1.Service, clusterName string) st
 }
 
 // Get returns the corresponding virtual machine service if it exists
-func (s *vmService) Get(ctx context.Context, service *v1.Service, clusterName string) (*vmopv1.VirtualMachineService, error) {
+func (s *vmService) Get(ctx context.Context, service *v1.Service, clusterName string) (*vmoptypes.VirtualMachineServiceInfo, error) {
 	logger := log.WithValues("name", service.Name, "namespace", service.Namespace)
 	logger.V(2).Info("Attempting to get VirtualMachineService")
 
-	vmService, err := s.vmClient.V1alpha2().VirtualMachineServices(s.namespace).Get(ctx, s.GetVMServiceName(service, clusterName), metav1.GetOptions{})
+	name := s.GetVMServiceName(service, clusterName)
+	vmService, err := s.vmClient.VirtualMachineServices().Get(ctx, s.namespace, name)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			// Fallback for resources created by an older release that used a
+			// different name-hashing scheme. Located via the always-present
+			// identifying labels rather than by recomputing the legacy name.
+			//
+			// Fail closed: if the legacy lookup itself errors, surface the error
+			// instead of returning "not found". Returning nil here would make the
+			// caller create a duplicate VirtualMachineService under the new name.
+			legacy, legacyErr := s.findLegacyVMService(ctx, service, clusterName)
+			if legacyErr != nil {
+				logger.Error(ErrGetVMService, fmt.Sprintf("legacy lookup failed: %v", legacyErr))
+				return nil, legacyErr
+			}
+			if legacy != nil {
+				logger.V(2).Info("VirtualMachineService not found by name; found legacy resource via labels", "legacyName", legacy.Name)
+				return legacy, nil
+			}
 			return nil, nil
 		}
 		logger.Error(ErrGetVMService, fmt.Sprintf("%v", err))
@@ -154,17 +204,17 @@ func (s *vmService) Get(ctx context.Context, service *v1.Service, clusterName st
 }
 
 // Create creates a vmservice to map to the given lb type of service, it should be called if vmservice not found
-func (s *vmService) Create(ctx context.Context, service *v1.Service, clusterName string) (*vmopv1.VirtualMachineService, error) {
+func (s *vmService) Create(ctx context.Context, service *v1.Service, clusterName string) (*vmoptypes.VirtualMachineServiceInfo, error) {
 	logger := log.WithValues("name", service.Name, "namespace", service.Namespace)
 	logger.V(2).Info("Attempting to create VirtualMachineService")
 
-	vmService, err := s.lbServiceToVMService(service, clusterName)
+	info, err := s.lbServiceToVMServiceInfo(service, clusterName)
 	if err != nil {
 		logger.Error(ErrCreateVMService, fmt.Sprintf("%v", err))
 		return nil, err
 	}
 
-	vmService, err = s.vmClient.V1alpha2().VirtualMachineServices(s.namespace).Create(ctx, vmService, metav1.CreateOptions{})
+	created, err := s.vmClient.VirtualMachineServices().Create(ctx, info)
 	if err != nil {
 		logger.Error(ErrCreateVMService, fmt.Sprintf("%v", err))
 		return nil, err
@@ -172,11 +222,11 @@ func (s *vmService) Create(ctx context.Context, service *v1.Service, clusterName
 
 	logger.V(2).Info("Successfully created VirtualMachineService")
 
-	return vmService, nil
+	return created, nil
 }
 
 // CreateOrUpdate creates a vmservice to map to the given lb type of service
-func (s *vmService) CreateOrUpdate(ctx context.Context, service *v1.Service, clusterName string) (*vmopv1.VirtualMachineService, error) {
+func (s *vmService) CreateOrUpdate(ctx context.Context, service *v1.Service, clusterName string) (*vmoptypes.VirtualMachineServiceInfo, error) {
 	logger := log.WithValues("name", service.Name, "namespace", service.Namespace)
 	logger.V(2).Info("Attempting to create or update a VirtualMachineService")
 
@@ -217,62 +267,94 @@ func (s *vmService) CreateOrUpdate(ctx context.Context, service *v1.Service, clu
 }
 
 // Update updates a vmservice
-func (s *vmService) Update(ctx context.Context, service *v1.Service, clusterName string, vmService *vmopv1.VirtualMachineService) (*vmopv1.VirtualMachineService, error) {
+func (s *vmService) Update(ctx context.Context, service *v1.Service, clusterName string, existing *vmoptypes.VirtualMachineServiceInfo) (*vmoptypes.VirtualMachineServiceInfo, error) {
 	logger := log.WithValues("name", service.Name, "namespace", service.Namespace)
 	logger.V(2).Info("Attempting to update VirtualMachineService")
 
-	// Compare the ports setting in service and vmService, update vmService if needed
 	ports, err := findPorts(service)
 	if err != nil {
 		logger.Error(ErrUpdateVMService, fmt.Sprintf("%v", err))
 		return nil, err
 	}
-	vmServicePorts := vmService.Spec.Ports
 
-	newVMService := vmService.DeepCopy()
+	annotations := getVMServiceAnnotations(service, s.serviceAnnotationPropagationEnabled)
 
-	if vmService.Spec.LoadBalancerSourceRanges == nil {
-		vmService.Spec.LoadBalancerSourceRanges = []string{}
+	// reflect.DeepEqual is used here intentionally: the compared types
+	// ([]VirtualMachineServicePort, []string, map[string]string) contain only
+	// plain value fields (no interfaces, no pointers, no unexported fields),
+	// so DeepEqual is both correct and safe. The call frequency is low (one
+	// per LoadBalancer reconcile), so the performance cost is acceptable.
+	//
+	// Normalize nil/empty slices and maps to nil before comparison to avoid
+	// spurious updates. For example, the API server may return an empty slice
+	// where the desired state has nil — both represent "not set". Normalising
+	// to nil (rather than to an empty value) is consistent with the Kubernetes
+	// convention that nil and empty are semantically equivalent for these fields.
+	existingRanges := existing.Spec.LoadBalancerSourceRanges
+	if len(existingRanges) == 0 {
+		existingRanges = nil
 	}
-	if service.Spec.LoadBalancerSourceRanges == nil {
-		service.Spec.LoadBalancerSourceRanges = []string{}
+	serviceRanges := service.Spec.LoadBalancerSourceRanges
+	if len(serviceRanges) == 0 {
+		serviceRanges = nil
 	}
+	existingAnnotations := existing.Annotations
+	if len(existingAnnotations) == 0 {
+		existingAnnotations = nil
+	}
+	desiredAnnotations := annotations
+	if len(desiredAnnotations) == 0 {
+		desiredAnnotations = nil
+	}
+	existingIPFams := existing.Spec.IPFamilies
+	if len(existingIPFams) == 0 {
+		existingIPFams = nil
+	}
+	desiredIPFams := cloneIPFamilies(service.Spec.IPFamilies)
+	servicePolicy := cloneIPFamilyPolicy(service.Spec.IPFamilyPolicy)
 
-	annotations := getVMServiceAnnotations(vmService, service, s.serviceAnnotationPropagationEnabled)
-
-	// VMService only has a few fields to be kept in sync so we will simply
-	// iterate over them
-	// As more fields are added, we need to consider adopting a patch helper
 	var needsUpdate bool
-	if !reflect.DeepEqual(vmServicePorts, ports) {
+	if !reflect.DeepEqual(existing.Spec.Ports, ports) {
 		needsUpdate = true
-		newVMService.Spec.Ports = ports
 	}
-	if vmService.Spec.LoadBalancerIP != service.Spec.LoadBalancerIP {
+	if existing.Spec.LoadBalancerIP != service.Spec.LoadBalancerIP {
 		needsUpdate = true
-		newVMService.Spec.LoadBalancerIP = service.Spec.LoadBalancerIP
 	}
-	if !reflect.DeepEqual(vmService.Spec.LoadBalancerSourceRanges, service.Spec.LoadBalancerSourceRanges) {
+	if !reflect.DeepEqual(existingRanges, serviceRanges) {
 		needsUpdate = true
-		newVMService.Spec.LoadBalancerSourceRanges = service.Spec.LoadBalancerSourceRanges
 	}
-	if !reflect.DeepEqual(vmService.Annotations, annotations) {
+	if !reflect.DeepEqual(existingAnnotations, desiredAnnotations) {
 		needsUpdate = true
-		newVMService.Annotations = annotations
+	}
+	if !reflect.DeepEqual(existingIPFams, desiredIPFams) {
+		needsUpdate = true
+	}
+	if !reflect.DeepEqual(existing.Spec.IPFamilyPolicy, servicePolicy) {
+		needsUpdate = true
 	}
 
 	if needsUpdate {
-		newVMService, err = s.vmClient.V1alpha2().VirtualMachineServices(s.namespace).Update(ctx, newVMService, metav1.UpdateOptions{})
+		update := &vmoptypes.VirtualMachineServiceInfo{
+			Annotations: annotations,
+			Spec: vmoptypes.VirtualMachineServiceSpec{
+				Ports:                    ports,
+				LoadBalancerIP:           service.Spec.LoadBalancerIP,
+				LoadBalancerSourceRanges: serviceRanges,
+				IPFamilies:               desiredIPFams,
+				IPFamilyPolicy:           servicePolicy,
+			},
+		}
+		result, err := s.vmClient.VirtualMachineServices().Update(ctx, s.namespace, existing.Name, update)
 		if err != nil {
 			logger.Error(ErrUpdateVMService, fmt.Sprintf("%v", err))
 			return nil, err
 		}
 
 		logger.V(2).Info("Successfully updated VirtualMachineService")
-		return newVMService, nil
+		return result, nil
 	}
 
-	return vmService, nil
+	return existing, nil
 }
 
 // Delete deletes the vmservice mapped to the given lb type of service
@@ -280,8 +362,35 @@ func (s *vmService) Delete(ctx context.Context, service *v1.Service, clusterName
 	logger := log.WithValues("name", service.Name, "namespace", service.Namespace)
 	logger.V(2).Info("Attempting to delete VirtualMachineService")
 
-	err := s.vmClient.V1alpha2().VirtualMachineServices(s.namespace).Delete(ctx, s.GetVMServiceName(service, clusterName), metav1.DeleteOptions{})
+	name := s.GetVMServiceName(service, clusterName)
+	err := s.vmClient.VirtualMachineServices().Delete(ctx, s.namespace, name)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Fallback: a resource created by an older release lives under a
+			// different name. Locate it via the identifying labels and delete it.
+			//
+			// Fail closed: if the legacy lookup errors, surface the error rather
+			// than reporting a successful delete. Returning nil could orphan a
+			// legacy VirtualMachineService that we simply failed to read.
+			legacy, legacyErr := s.findLegacyVMService(ctx, service, clusterName)
+			if legacyErr != nil {
+				logger.Error(ErrDeleteVMService, fmt.Sprintf("legacy lookup failed: %v", legacyErr))
+				return legacyErr
+			}
+			if legacy == nil {
+				return nil
+			}
+			logger.V(2).Info("VirtualMachineService not found by name; deleting legacy resource found via labels", "legacyName", legacy.Name)
+			if derr := s.vmClient.VirtualMachineServices().Delete(ctx, s.namespace, legacy.Name); derr != nil {
+				if apierrors.IsNotFound(derr) {
+					return nil
+				}
+				logger.Error(ErrDeleteVMService, fmt.Sprintf("failed to delete legacy VirtualMachineService: %v", derr))
+				return derr
+			}
+			logger.V(2).Info("Successfully deleted legacy VirtualMachineService")
+			return nil
+		}
 		logger.Error(ErrDeleteVMService, fmt.Sprintf("%v", err))
 		return err
 	}
@@ -290,13 +399,13 @@ func (s *vmService) Delete(ctx context.Context, service *v1.Service, clusterName
 	return nil
 }
 
-func findPorts(service *v1.Service) ([]vmopv1.VirtualMachineServicePort, error) {
-	var ports []vmopv1.VirtualMachineServicePort
+func findPorts(service *v1.Service) ([]vmoptypes.VirtualMachineServicePort, error) {
+	ports := make([]vmoptypes.VirtualMachineServicePort, 0, len(service.Spec.Ports))
 	for _, port := range service.Spec.Ports {
 		if port.NodePort == 0 {
 			return nil, errors.Wrapf(ErrNodePortNotFound, "port %s", port.Name)
 		}
-		ports = append(ports, vmopv1.VirtualMachineServicePort{
+		ports = append(ports, vmoptypes.VirtualMachineServicePort{
 			Name:       port.Name,
 			Port:       port.Port,
 			TargetPort: port.NodePort,
@@ -306,69 +415,59 @@ func findPorts(service *v1.Service) ([]vmopv1.VirtualMachineServicePort, error) 
 	return ports, nil
 }
 
-func (s *vmService) lbServiceToVMService(service *v1.Service, clusterName string) (*vmopv1.VirtualMachineService, error) {
+func (s *vmService) lbServiceToVMServiceInfo(service *v1.Service, clusterName string) (*vmoptypes.VirtualMachineServiceInfo, error) {
 	ports, err := findPorts(service)
 	if err != nil {
 		return nil, err
 	}
-	vmServiceSpec := vmopv1.VirtualMachineServiceSpec{
-		Type:  vmopv1.VirtualMachineServiceTypeLoadBalancer,
-		Ports: ports,
-		Selector: map[string]string{
-			ClusterSelectorKey: clusterName,
-			NodeSelectorKey:    NodeRole,
-		},
-		// When service has spec.loadBalancerIP specified, pass it to the
-		// corresponding VirtualMachineService
-		LoadBalancerIP: service.Spec.LoadBalancerIP,
-		// When service has spec.LoadBalancerSourceRanges specified,
-		// pass it to the corresponding VirtualMachineService
-		LoadBalancerSourceRanges: service.Spec.LoadBalancerSourceRanges,
-	}
 
+	selector := map[string]string{
+		ClusterSelectorKey: clusterName,
+		NodeSelectorKey:    NodeRole,
+	}
 	if IsLegacy {
-		vmServiceSpec.Selector = map[string]string{
+		selector = map[string]string{
 			LegacyClusterSelectorKey: clusterName,
 			LegacyNodeSelectorKey:    NodeRole,
 		}
 	}
 
-	label := map[string]string{
-		LabelClusterNameKey:      clusterName,
-		LabelServiceNameKey:      service.Name,
-		LabelServiceNameSpaceKey: service.Namespace,
-	}
-
-	vmService := &vmopv1.VirtualMachineService{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: vmopclient.VirtualMachineServiceGVR.Group + "/" + vmopclient.VirtualMachineServiceGVR.Version,
-			Kind:       "VirtualMachineService",
+	info := &vmoptypes.VirtualMachineServiceInfo{
+		Name:      s.GetVMServiceName(service, clusterName),
+		Namespace: s.namespace,
+		Labels: map[string]string{
+			LabelClusterNameKey:      clusterName,
+			LabelServiceNameKey:      service.Name,
+			LabelServiceNameSpaceKey: service.Namespace,
 		},
-		ObjectMeta: metav1.ObjectMeta{
-			Labels: label,
-			Name:   s.GetVMServiceName(service, clusterName),
-			OwnerReferences: []metav1.OwnerReference{
-				*s.ownerReference,
-			},
+		OwnerReferences: []metav1.OwnerReference{
+			*s.ownerReference,
 		},
-		Spec: vmServiceSpec,
+		Spec: vmoptypes.VirtualMachineServiceSpec{
+			Type:                     vmoptypes.VirtualMachineServiceTypeLoadBalancer,
+			Ports:                    ports,
+			Selector:                 selector,
+			LoadBalancerIP:           service.Spec.LoadBalancerIP,
+			LoadBalancerSourceRanges: service.Spec.LoadBalancerSourceRanges,
+			IPFamilies:               cloneIPFamilies(service.Spec.IPFamilies),
+			IPFamilyPolicy:           cloneIPFamilyPolicy(service.Spec.IPFamilyPolicy),
+		},
 	}
 
-	if annotations := getVMServiceAnnotations(vmService, service, s.serviceAnnotationPropagationEnabled); len(annotations) != 0 {
-		vmService.Annotations = annotations
+	if annotations := getVMServiceAnnotations(service, s.serviceAnnotationPropagationEnabled); len(annotations) != 0 {
+		info.Annotations = annotations
 	}
 
-	return vmService, nil
+	return info, nil
 }
 
-func getVMServiceAnnotations(vmService *vmopv1.VirtualMachineService, service *v1.Service, serviceAnnotationPropagationEnabled bool) map[string]string {
+func getVMServiceAnnotations(service *v1.Service, serviceAnnotationPropagationEnabled bool) map[string]string {
 	var annotations map[string]string
 	// When ExternalTrafficPolicy is set to Local in the Service, add its
-	// value and the healthCheckNodePort to VirtualMachineService
-	// labels
+	// value and the healthCheckNodePort to VirtualMachineService annotations.
 	// When ExternalTrafficPolicy is set to Cluster, do nothing as that's
 	// the default value, also there will be no HealthCheckNodePort
-	// allocated in that case
+	// allocated in that case.
 	if service.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal {
 		annotations = make(map[string]string)
 		annotations[AnnotationServiceExternalTrafficPolicyKey] = string(service.Spec.ExternalTrafficPolicy)
@@ -377,11 +476,9 @@ func getVMServiceAnnotations(vmService *vmopv1.VirtualMachineService, service *v
 
 	// Annotation propagation logic
 	if serviceAnnotationPropagationEnabled {
-		// Initialize annotations map if empty
 		if annotations == nil {
 			annotations = make(map[string]string)
 		}
-		// Merge service annotations
 		for k, v := range service.Annotations {
 			if !slices.Contains(excludedAnnotations, k) {
 				annotations[k] = v
@@ -392,9 +489,26 @@ func getVMServiceAnnotations(vmService *vmopv1.VirtualMachineService, service *v
 	return annotations
 }
 
-func getVMServiceIP(vmService *vmopv1.VirtualMachineService) string {
-	if len(vmService.Status.LoadBalancer.Ingress) > 0 {
-		return vmService.Status.LoadBalancer.Ingress[0].IP
+func cloneIPFamilies(f []v1.IPFamily) []v1.IPFamily {
+	if len(f) == 0 {
+		return nil
+	}
+	out := make([]v1.IPFamily, len(f))
+	copy(out, f)
+	return out
+}
+
+func cloneIPFamilyPolicy(p *v1.IPFamilyPolicyType) *v1.IPFamilyPolicyType {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func getVMServiceIP(vmService *vmoptypes.VirtualMachineServiceInfo) string {
+	if len(vmService.Status.LoadBalancerIngress) > 0 {
+		return vmService.Status.LoadBalancerIngress[0].IP
 	}
 	return ""
 }
