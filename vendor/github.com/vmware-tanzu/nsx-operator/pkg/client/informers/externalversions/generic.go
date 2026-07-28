@@ -6,7 +6,7 @@
 package externalversions
 
 import (
-	"fmt"
+	fmt "fmt"
 
 	v1alpha1 "github.com/vmware-tanzu/nsx-operator/pkg/apis/vpc/v1alpha1"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -54,6 +54,10 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Crd().V1alpha1().StaticRoutes().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("subnets"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Crd().V1alpha1().Subnets().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("subnetconnectionbindingmaps"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Crd().V1alpha1().SubnetConnectionBindingMaps().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("subnetipreservations"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Crd().V1alpha1().SubnetIPReservations().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("subnetports"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Crd().V1alpha1().SubnetPorts().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("subnetsets"):

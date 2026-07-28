@@ -29,9 +29,14 @@ TEST_DIR := test
 TOOLS_DIR := $(abspath hack/tools)
 TOOLS_BIN_DIR := $(TOOLS_DIR)/bin
 
+#
+# Go.
+#
+GO_VERSION ?= 1.26.5
+
 # Binaries
 GO_INSTALL := ./hack/go-install.sh
-TRIVY_VER := 0.49.1
+TRIVY_VER := 0.69.2
 GOVULNCHECK_BIN := govulncheck
 GOVULNCHECK_VER := v1.1.4
 GOVULNCHECK := $(abspath $(TOOLS_BIN_DIR)/$(GOVULNCHECK_BIN)-$(GOVULNCHECK_VER))
@@ -314,8 +319,8 @@ quick-conformance-test: conformance-test
 ################################################################################
 ##                                LINT & VERIFY                               ##
 ################################################################################
-.PHONY: fmt vet lint mdlint shellcheck staticcheck check
-check: fmt lint mdlint shellcheck staticcheck vet
+.PHONY: fmt vet lint mdlint shellcheck staticcheck verify-boilerplate check
+check: fmt lint mdlint shellcheck staticcheck vet verify-boilerplate
 
 fmt:
 	hack/check-format.sh
@@ -334,6 +339,9 @@ staticcheck:
 
 vet:
 	hack/check-vet.sh
+
+verify-boilerplate:
+	hack/check-boilerplate.sh
 
 .PHONY: verify-container-images
 verify-container-images: ## Verify container images

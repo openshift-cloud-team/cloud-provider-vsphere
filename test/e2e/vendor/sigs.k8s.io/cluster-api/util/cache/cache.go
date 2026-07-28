@@ -17,14 +17,15 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	kcache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	runtimecatalog "sigs.k8s.io/cluster-api/api/runtime/catalog"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
-	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
 )
 
 const (
@@ -57,13 +58,16 @@ type Cache[E Entry] interface {
 
 	// Len returns the number of entries in the cache.
 	Len() int
+
+	// DeleteAll deletes all entries from the cache.
+	DeleteAll()
 }
 
 // New creates a new cache.
 // ttl is the duration for which we keep entries in the cache.
-func New[E Entry](ttl time.Duration) Cache[E] {
+func New[E Entry](ctx context.Context, ttl time.Duration) Cache[E] {
 	r := &cache[E]{
-		Store: kcache.NewTTLStore(func(obj interface{}) (string, error) {
+		Store: kcache.NewTTLStore(func(obj any) (string, error) {
 			// We only add objects of type E to the cache, so it's safe to cast to E.
 			return obj.(E).Key(), nil
 		}, ttl),
@@ -75,7 +79,11 @@ func New[E Entry](ttl time.Duration) Cache[E] {
 			// items lazily. If we don't do this the cache grows indefinitely.
 			r.List()
 
-			time.Sleep(expirationInterval)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(expirationInterval):
+			}
 		}
 	}()
 	return r
@@ -106,6 +114,11 @@ func (r *cache[E]) Has(key string) (E, bool) {
 
 func (r *cache[E]) Len() int {
 	return len(r.ListKeys())
+}
+
+func (r *cache[E]) DeleteAll() {
+	// Note: We are intentionally using Replace instead of List + Delete because the latter would be racy.
+	_ = r.Store.Replace(nil, "")
 }
 
 // HookEntry is an Entry for the hook Cache.

@@ -1026,7 +1026,7 @@ func fillConfigSpecWithDatastore(ctx *Context, inputConfigSpec, configSpec *type
 func generateInitialPlacementAction(ctx *Context, vmSpec *types.PlaceVmsXClusterSpecVmPlacementSpec, pool *ResourcePool,
 	cluster *ClusterComputeResource, hostRequired, datastoreRequired bool) types.BaseClusterAction {
 
-	placementAction := &types.ClusterClusterInitialPlacementActionEx{
+	placementAction := &types.ClusterClusterInitialPlacementAction{
 		Pool: pool.Self,
 	}
 
@@ -1178,4 +1178,8 @@ func (f *Folder) PlaceVmsXCluster(ctx *Context, req *types.PlaceVmsXCluster) soa
 
 	body.Fault_ = Fault("", &types.InvalidArgument{InvalidProperty: "placementType"})
 	return body
+}
+
+func (f *Folder) SetCustomValue(ctx *Context, req *types.SetCustomValue) soap.HasFault {
+	return SetCustomValue(ctx, req)
 }

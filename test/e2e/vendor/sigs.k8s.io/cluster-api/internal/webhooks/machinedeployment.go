@@ -22,24 +22,24 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/admission/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/feature"
 	topologynames "sigs.k8s.io/cluster-api/internal/topology/names"
-	"sigs.k8s.io/cluster-api/util/version"
+	"sigs.k8s.io/cluster-api/internal/util/taints"
+	"sigs.k8s.io/cluster-api/webhooks/conversion"
 )
 
 func (webhook *MachineDeployment) SetupWebhookWithManager(mgr ctrl.Manager) error {
@@ -47,31 +47,26 @@ func (webhook *MachineDeployment) SetupWebhookWithManager(mgr ctrl.Manager) erro
 		webhook.decoder = admission.NewDecoder(mgr.GetScheme())
 	}
 
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&clusterv1.MachineDeployment{}).
+	return ctrl.NewWebhookManagedBy(mgr, &clusterv1.MachineDeployment{}).
 		WithDefaulter(webhook).
 		WithValidator(webhook).
+		WithConverter(conversion.MachineDeployment).
 		Complete()
 }
 
-// +kubebuilder:webhook:verbs=create;update,path=/validate-cluster-x-k8s-io-v1beta2-machinedeployment,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=cluster.x-k8s.io,resources=machinedeployments,versions=v1beta2,name=validation.machinedeployment.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1;v1beta1
-// +kubebuilder:webhook:verbs=create;update,path=/mutate-cluster-x-k8s-io-v1beta2-machinedeployment,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,groups=cluster.x-k8s.io,resources=machinedeployments,versions=v1beta2,name=default.machinedeployment.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1;v1beta1
+// +kubebuilder:webhook:verbs=create;update,path=/validate-cluster-x-k8s-io-v1beta2-machinedeployment,mutating=false,failurePolicy=fail,matchPolicy=Equivalent,groups=cluster.x-k8s.io,resources=machinedeployments,versions=v1beta2,name=validation.machinedeployment.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1
+// +kubebuilder:webhook:verbs=create;update,path=/mutate-cluster-x-k8s-io-v1beta2-machinedeployment,mutating=true,failurePolicy=fail,matchPolicy=Equivalent,groups=cluster.x-k8s.io,resources=machinedeployments,versions=v1beta2,name=default.machinedeployment.cluster.x-k8s.io,sideEffects=None,admissionReviewVersions=v1
 
 // MachineDeployment implements a validation and defaulting webhook for MachineDeployment.
 type MachineDeployment struct {
 	decoder admission.Decoder
 }
 
-var _ webhook.CustomDefaulter = &MachineDeployment{}
-var _ webhook.CustomValidator = &MachineDeployment{}
+var _ admission.Defaulter[*clusterv1.MachineDeployment] = &MachineDeployment{}
+var _ admission.Validator[*clusterv1.MachineDeployment] = &MachineDeployment{}
 
 // Default implements webhook.CustomDefaulter.
-func (webhook *MachineDeployment) Default(ctx context.Context, obj runtime.Object) error {
-	m, ok := obj.(*clusterv1.MachineDeployment)
-	if !ok {
-		return apierrors.NewBadRequest(fmt.Sprintf("expected a MachineDeployment but got a %T", obj))
-	}
-
+func (webhook *MachineDeployment) Default(ctx context.Context, m *clusterv1.MachineDeployment) error {
 	req, err := admission.RequestFromContext(ctx)
 	if err != nil {
 		return err
@@ -142,32 +137,17 @@ func (webhook *MachineDeployment) Default(ctx context.Context, obj runtime.Objec
 }
 
 // ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type.
-func (webhook *MachineDeployment) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	m, ok := obj.(*clusterv1.MachineDeployment)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a MachineDeployment but got a %T", obj))
-	}
-
+func (webhook *MachineDeployment) ValidateCreate(_ context.Context, m *clusterv1.MachineDeployment) (admission.Warnings, error) {
 	return nil, webhook.validate(nil, m)
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
-func (webhook *MachineDeployment) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	oldMD, ok := oldObj.(*clusterv1.MachineDeployment)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a MachineDeployment but got a %T", oldObj))
-	}
-
-	newMD, ok := newObj.(*clusterv1.MachineDeployment)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected a MachineDeployment but got a %T", newObj))
-	}
-
+func (webhook *MachineDeployment) ValidateUpdate(_ context.Context, oldMD, newMD *clusterv1.MachineDeployment) (admission.Warnings, error) {
 	return nil, webhook.validate(oldMD, newMD)
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type.
-func (webhook *MachineDeployment) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (webhook *MachineDeployment) ValidateDelete(_ context.Context, _ *clusterv1.MachineDeployment) (admission.Warnings, error) {
 	return nil, nil
 }
 
@@ -247,14 +227,17 @@ func (webhook *MachineDeployment) validate(oldMD, newMD *clusterv1.MachineDeploy
 	allErrs = append(allErrs, validateRemediationMaxInFlight(specPath.Child("remediation"), newMD.Spec.Remediation.MaxInFlight)...)
 
 	if newMD.Spec.Template.Spec.Version != "" {
-		if !version.KubeSemver.MatchString(newMD.Spec.Template.Spec.Version) {
+		if !strings.HasPrefix(newMD.Spec.Template.Spec.Version, "v") {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("template", "spec", "version"), newMD.Spec.Template.Spec.Version, "must start with v"))
+		}
+		if _, err := semver.Parse(strings.TrimPrefix(newMD.Spec.Template.Spec.Version, "v")); err != nil {
 			allErrs = append(allErrs, field.Invalid(specPath.Child("template", "spec", "version"), newMD.Spec.Template.Spec.Version, "must be a valid semantic version"))
 		}
 	}
 
 	allErrs = append(allErrs, validateMDMachineNaming(newMD.Spec.MachineNaming, specPath.Child("machineNaming"))...)
 
-	allErrs = append(allErrs, validateMachineTaints(newMD.Spec.Template.Spec.Taints, specPath.Child("template", "spec", "taints"))...)
+	allErrs = append(allErrs, taints.ValidateMachineTaints(newMD.Spec.Template.Spec.Taints, specPath.Child("template", "spec", "taints"))...)
 	allErrs = append(allErrs, validateMachineTaintsForWorkers(newMD.Spec.Template.Spec.Taints, nil, specPath.Child("template", "spec", "taints"))...)
 
 	// Validate the metadata of the template.
